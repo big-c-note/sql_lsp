@@ -1,6 +1,7 @@
 from collections import defaultdict, deque
 import json
 import logging
+from pathlib import Path
 import typing as t
 
 from lsprotocol.types import (
@@ -8,12 +9,16 @@ from lsprotocol.types import (
     CompletionList,
     CompletionParams,
     CompletionItemKind,
+    Diagnostic,
+    DiagnosticSeverity,
+    DidChangeTextDocumentParams,
     Hover,
     HoverParams,
     MarkupContent,
     MarkupKind,
+    Position,
+    Range,
 )
-from pathlib import Path
 from pygls.server import LanguageServer
 from sqlglot import parse_one, exp
 from sqlglot.errors import ErrorLevel
@@ -29,7 +34,6 @@ from sqlglot.optimizer.qualify import qualify
 logging.basicConfig(filename="sql_lsp.log", filemode="w", level=logging.DEBUG)
 
 
-# TODO call sql lsp
 server = LanguageServer("sql_lsp", "v0.1")
 
 # Load metadata (your cached Databricks metadata)
@@ -38,8 +42,10 @@ server = LanguageServer("sql_lsp", "v0.1")
 # TODO readme on adding other dialects
 # TODO get this a lighter weight pull in a dialect specific dir
 # TODO option to config ther refresh time
+
+# Globals
 DIALECT = "spark"
-CATALOG_SCHEMA_PATH: str = ""
+CATALOG_SCHEMA_PATH: str = "~/.nvim-databricks/databricks_schema.json"
 
 
 def _get_databricks_schema(
@@ -47,7 +53,7 @@ def _get_databricks_schema(
 ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
     with open(catalog_schema_path) as f:
         # TODO: validate catalog db table schema with response and column /
-        # type info
+        # type infos
         catalog_schema = json.load(f)
 
     # TODO: finish types
@@ -73,11 +79,23 @@ def _get_databricks_schema(
         lambda: defaultdict(dict)
     )
 
-    for catalog in catalog_schema.keys():
-        for db in catalog_schema[catalog].keys():
-            for table in catalog_schema[catalog][db].keys():
+    for catalog in catalog_schema["catalogs"].keys():
+        for db in catalog_schema["catalogs"][catalog]["schemas"].keys():
+            for table in catalog_schema["catalogs"][catalog]["schemas"][db][
+                "tables"
+            ].keys():
                 column_schema = {}
-                columns = table["response"]["columns"]
+                # TODO
+                columns = (
+                    catalog_schema.get("catalogs", {})
+                    .get(catalog, {})
+                    .get("schemas", {})
+                    .get(db, {})
+                    .get("tables", {})
+                    .get(table, {})
+                    .get("response", {})
+                    .get("columns", {})
+                )
                 for col in columns:
                     if "type_name" in col.keys():
                         column_schema[col["name"]] = type_map[col["type_name"]]
@@ -94,14 +112,21 @@ def _get_databricks_schema(
 def get_schema(
     catalog_schema_path: str | Path, dialect: str = "databicks"
 ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
-    catalog_schema_path = Path(catalog_schema_path)
-    if dialect == "databricks":
+    # TODO fix
+    catalog_schema_path = Path(catalog_schema_path).expanduser()
+    if dialect == "databricks" or dialect == "spark":
+        # TODO change to spark or have additional databricks dialect that
+        # converts to spark sqlglot dialect
         schema = _get_databricks_schema(catalog_schema_path)
     else:
         raise NotImplementedError("Only databricks sql is currently supported")
     return schema
 
 
+SCHEMA = get_schema(CATALOG_SCHEMA_PATH, DIALECT)
+
+
+# Sqlglot helpers
 def bfs_limited(
     root: exp.Expression,
     max_depth: int = 1,
@@ -126,11 +151,18 @@ def bfs_limited(
             queue.extend((child, depth + 1) for child in node.iter_expressions())
 
 
-SCHEMA = get_schema(DIALECT)
-
-
+# Interop between sqlglot and pygls
 def lsp_position_to_cursor_offset(lines: list[str], line: int, character: int) -> int:
     return sum(len(ln) + 1 for ln in lines[:line]) + character
+
+
+def offset_to_lsp_position(lines: list[str], offset: int) -> Position:
+    total = 0
+    for i, line in enumerate(lines):
+        if total + len(line) + 1 > offset:
+            return Position(line=i, character=offset - total)
+        total += len(line) + 1
+    return Position(line=len(lines) - 1, character=len(lines[-1]))
 
 
 def find_node_before_cursor(tree, cursor_offset: int):
@@ -141,17 +173,6 @@ def find_node_before_cursor(tree, cursor_offset: int):
     best_span = -1
 
     for node in tree.walk():
-        """
-        if (
-            isinstance(node, exp.From)
-            and isinstance(node.this, exp.Table)
-            and isinstance(node.this.this, exp.Identifier)
-            and node.this.this.name.lower() == "c"
-        ):
-            import pdb
-
-            pdb.set_trace()
-        """
         meta = node.meta or {}
         start = meta.get("start")
         end = meta.get("end")
@@ -172,7 +193,7 @@ def find_node_before_cursor(tree, cursor_offset: int):
 # other
 def get_candidate_table_names(prefix: str, tree) -> list[str]:
     # TODO change func name
-    database_table_names: list[str] = get_all_table_names()
+    database_table_names: list[str] = get_database_table_names()
     cte_table_names: list[str] = get_candidate_cte_names(tree)
     all_table_names: list[str] = database_table_names + cte_table_names
     # Note: prefix will never contain a dot at the end. TODO test this, nvim
@@ -251,8 +272,8 @@ def get_columns_from_table_node(table_node, ctes):
             columns = _get_column_names_from_cte(table_node)
             column_names += [table_alias + col for col in columns]
         else:
-            columns = get_columns_for_table(full_table_name)
-            column_names += [table_alias + col["name"] for col in columns]
+            columns = get_columns_from_database_table(full_table_name).keys()
+            column_names += [table_alias + col for col in columns]
 
     elif isinstance(table_node, exp.Subquery):
         columns = _get_column_names_from_subquery(table_node)
@@ -323,49 +344,28 @@ def get_columns_from_select(select_node):
     return columns
 
 
-# TODO: Base this off schema cache
-def get_all_table_names() -> list[str]:
+def get_database_table_names(schema=SCHEMA) -> list[str]:
     tables = []
-    for catalog in catalog_data["catalogs"].values():
-        for schema in catalog["schemas"].values():
-            for table in schema["tables"].values():
-                tables.append(table["response"]["full_name"])
+    for catalog in schema.keys():
+        for db in schema[catalog].keys():
+            for table in schema[catalog][db].keys():
+                # TODO: consider allowing for non full tables or assert the
+                # schema structure
+                tables.append(catalog + "." + db + "." + table)
     return tables
 
 
-# TODO: Base this off schema cache
-# TODO for database table
-def get_columns_for_table(full_table_name):
-    for catalog in catalog_data["catalogs"].values():
-        for schema in catalog["schemas"].values():
-            for table in schema["tables"].values():
-                if table["response"]["full_name"] == full_table_name:
-                    return table["response"]["columns"]
-    return []
-
-
-from lsprotocol.types import (
-    Diagnostic,
-    DiagnosticSeverity,
-    Range,
-    Position,
-    DidChangeTextDocumentParams,
-)
-
-
-def offset_to_lsp_position(lines: list[str], offset: int) -> Position:
-    total = 0
-    for i, line in enumerate(lines):
-        if total + len(line) + 1 > offset:
-            return Position(line=i, character=offset - total)
-        total += len(line) + 1
-    return Position(line=len(lines) - 1, character=len(lines[-1]))
+def get_columns_from_database_table(full_table_name: str, schema=SCHEMA):
+    # TODO: consider allowing for non full tables or assert the
+    # schema structure
+    catalog, db, table = full_table_name.split(".")
+    return schema[catalog][db][table]
 
 
 # TODO change candidae table names
 def generate_diagnostics(tree, lines):
     diagnostics = []
-    all_tables = set(get_all_table_names())
+    all_tables = set(get_database_table_names())
     cte_names = set(get_candidate_cte_names(tree))
 
     for node in tree.find_all(exp.Table):
@@ -381,7 +381,7 @@ def generate_diagnostics(tree, lines):
                     ),
                     message=f"Unknown table: '{table_name}'",
                     severity=DiagnosticSeverity.Error,
-                    source="databricks_sql_lsp",
+                    source="sql_lsp",
                 )
             )
 
@@ -397,7 +397,7 @@ def generate_diagnostics(tree, lines):
                     ),
                     message=f"Unknown column type for '{node.this.this}'",
                     severity=DiagnosticSeverity.Warning,
-                    source="databricks_sql_lsp",
+                    source="sql_lsp",
                 )
             )
 
@@ -422,7 +422,7 @@ def generate_diagnostics(tree, lines):
                         message=f"Unknown column: '{column_name}'",
                         severity=DiagnosticSeverity.Error,
                         # TODO change source
-                        source="databricks_sql_lsp",
+                        source="sql_lsp",
                     )
                 )
 
@@ -436,9 +436,8 @@ def did_change(params: DidChangeTextDocumentParams):
 
     tree_0 = parse_one(doc.source, dialect=DIALECT, error_level=ErrorLevel.IGNORE)
     # TODO see if qualify should be used always
-    schema = get_schema()
-    qual = qualify(tree_0, dialect="spark", schema=schema)
-    tree = annotate_types(qual, dialect="spark", schema=schema)
+    qual = qualify(tree_0, dialect="spark", schema=SCHEMA)
+    tree = annotate_types(qual, dialect="spark", schema=SCHEMA)
 
     diagnostics = generate_diagnostics(tree, lines)
     server.publish_diagnostics(doc.uri, diagnostics)
@@ -493,9 +492,8 @@ def hover(params: HoverParams):
     line = doc.source.splitlines()[line_position]
 
     tree_0 = parse_one(doc.source, dialect=DIALECT, error_level=ErrorLevel.IGNORE)
-    schema = get_schema()
-    qual = qualify(tree_0, dialect="spark", schema=schema)
-    tree = annotate_types(qual, dialect="spark", schema=schema)
+    qual = qualify(tree_0, dialect="spark", schema=SCHEMA)
+    tree = annotate_types(qual, dialect="spark", schema=SCHEMA)
     cursor_offset = lsp_position_to_cursor_offset(lines, line_position, cursor_position)
     node = find_node_before_cursor(tree, cursor_offset)
     if node and isinstance(node.parent, exp.Column):
