@@ -21,29 +21,24 @@ from lsprotocol.types import (
 )
 from pygls.server import LanguageServer
 from sqlglot import parse_one, exp
-from sqlglot.errors import ErrorLevel
+from sqlglot.errors import ErrorLevel, OptimizeError
 from sqlglot.optimizer.annotate_types import annotate_types
 from sqlglot.optimizer.qualify import qualify
 
-# TODO tests
-# TODO mention future of funcs and auto complete of types and things, maybe
-# that is another thing
-
-
-# TODO check how are debugs configed?
+# TODO: how to set debug?
 logging.basicConfig(filename="sql_lsp.log", filemode="w", level=logging.DEBUG)
 
 
 server = LanguageServer("sql_lsp", "v0.1")
 
-# Load metadata (your cached Databricks metadata)
 # TODO: make this variable via config.
-# TODO what other configs
 # TODO readme on adding other dialects
 # TODO get this a lighter weight pull in a dialect specific dir
-# TODO option to config ther refresh time
+# Try using update_positions
+# TODO add tests
+# TODO try using sql glot for the bfs
+# TODO try docstrings
 
-# Globals
 DIALECT = "spark"
 CATALOG_SCHEMA_PATH: str = "~/.nvim-databricks/databricks_schema.json"
 
@@ -51,6 +46,7 @@ CATALOG_SCHEMA_PATH: str = "~/.nvim-databricks/databricks_schema.json"
 def _get_databricks_schema(
     catalog_schema_path: str | Path,
 ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
+    catalog_schema_path = Path(catalog_schema_path)
     with open(catalog_schema_path) as f:
         # TODO: validate catalog db table schema with response and column /
         # type infos
@@ -73,7 +69,7 @@ def _get_databricks_schema(
         "TIMESTAMP": "TIMESTAMP",
     }
     # Note: this is the schema as per sqlglot schema. However, we could add
-    # arbitrary metadata and chage the getter funcs to extend hover
+    # arbitrary metadata and change the getter funcs to extend hover
     # capabilities.
     schema: dict[str, dict[str, dict[str, dict[str, str]]]] = defaultdict(
         lambda: defaultdict(dict)
@@ -85,7 +81,6 @@ def _get_databricks_schema(
                 "tables"
             ].keys():
                 column_schema = {}
-                # TODO
                 columns = (
                     catalog_schema.get("catalogs", {})
                     .get(catalog, {})
@@ -105,14 +100,15 @@ def _get_databricks_schema(
                         logging.warning(
                             f"There is no type information under keys `type` and `type_name` for column {col['name']}"
                         )
-                schema[catalog][db][table] = column_schema
+                # If there are no columns, then sqlglot will error on it.
+                if column_schema:
+                    schema[catalog][db][table] = column_schema
     return schema
 
 
 def get_schema(
     catalog_schema_path: str | Path, dialect: str = "databicks"
 ) -> dict[str, dict[str, dict[str, dict[str, str]]]]:
-    # TODO fix
     catalog_schema_path = Path(catalog_schema_path).expanduser()
     if dialect == "databricks" or dialect == "spark":
         # TODO change to spark or have additional databricks dialect that
@@ -152,6 +148,7 @@ def bfs_limited(
 
 
 # Interop between sqlglot and pygls
+# TODO may need to change if end index changes
 def lsp_position_to_cursor_offset(lines: list[str], line: int, character: int) -> int:
     return sum(len(ln) + 1 for ln in lines[:line]) + character
 
@@ -165,7 +162,7 @@ def offset_to_lsp_position(lines: list[str], offset: int) -> Position:
     return Position(line=len(lines) - 1, character=len(lines[-1]))
 
 
-def find_node_before_cursor(tree, cursor_offset: int):
+def find_node_before_cursor(tree: exp.Select, cursor_offset: int):
     """
     Find the deepest node in the AST that starts before or contains the cursor position.
     """
@@ -174,6 +171,7 @@ def find_node_before_cursor(tree, cursor_offset: int):
 
     for node in tree.walk():
         meta = node.meta or {}
+        # TODO change this if we do update_pos
         start = meta.get("start")
         end = meta.get("end")
 
@@ -188,113 +186,125 @@ def find_node_before_cursor(tree, cursor_offset: int):
     return best_node
 
 
-# TODO test all these
-# TODO does make sense to pass tablenode because then i can do it like the
-# other
-def get_candidate_table_names(prefix: str, tree) -> list[str]:
-    # TODO change func name
-    database_table_names: list[str] = get_database_table_names()
-    cte_table_names: list[str] = get_candidate_cte_names(tree)
-    all_table_names: list[str] = database_table_names + cte_table_names
-    # Note: prefix will never contain a dot at the end. TODO test this, nvim
-    # not letting me.
-    candidate_table_names = [
-        table_name
-        for table_name in all_table_names
-        if table_name.startswith(prefix) or table_name.startswith(prefix + ".")
-    ]
-    return candidate_table_names
+def get_columns_from_database_table(
+    full_table_name: str, table_alias: str = "", schema=SCHEMA
+) -> dict[str, str]:
+    # TODO: consider allowing for non full tables or assert the
+    # schema structure
+    catalog, db, table = full_table_name.split(".")
+    columns: dict[str, str] = schema[catalog][db][table]
+    columns_with_alias: dict[str, str] = {
+        table_alias + col: _type for col, _type in columns.items()
+    }
+    return columns_with_alias
 
 
-def get_candidate_cte_names(tree) -> list[str]:
-    candidate_cte_names = [node.alias for node in tree.find_all(exp.CTE)]
-    return candidate_cte_names
+def get_table_nodes_from_select(
+    select_node: exp.Select,
+) -> list[exp.Table | exp.Subquery]:
+    """
+    Get all table or subquery nodes from (FROM, JOIN, CTEs) from a Select node.
+    Note: `exp.Subquery` is handled differently than `exp.Table`. Consider
+    creating a type for both.
+    """
+    table_nodes = []
+
+    # TODO: type these
+    from_clause = select_node.args.get("from")
+    if from_clause:
+        table_node = from_clause.this
+        table_nodes.append(table_node)
+
+    for join in select_node.args.get("joins", []):
+        table_node = join.this
+        table_nodes.append(table_node)
+
+    return table_nodes
 
 
-# TODO get types as well. check if the args this is best way
-def _get_column_names_from_cte(cte_node: exp.Table) -> list[str]:
-    column_names = [
-        column_node.this.this
-        for column_node in bfs_limited(cte_node.args["this"], 1, (exp.Column))
-    ]
-    alias_names = [
-        alias_node.alias
-        for alias_node in bfs_limited(cte_node.args["this"], 1, (exp.Alias))
-    ]
-    return column_names + alias_names
+def get_ctes(tree: exp.Select) -> dict[str, exp.CTE]:
+    ctes = {}
+    # Full name of a cte is always == alias.
+    if "with" in tree.args.keys():
+        for cte in tree.args["with"].args["expressions"]:
+            ctes[cte.alias] = cte
+    return ctes
 
 
-# TODO may make sense to combine with above call them columns
-def _get_column_names_from_subquery(subquery_node: exp.Subquery) -> list[str]:
-    # TODO: combine with above.
+def _get_columns_from_cte(
+    table_node: exp.Table, table_alias: str
+) -> dict[str, str | None]:
+    columns = {
+        table_alias
+        + column_node.this.this: getattr(
+            getattr(column_node, "_type", None), "this", None
+        )
+        for column_node in bfs_limited(table_node.args["this"], 1, (exp.Column))
+    }
+    aliases = {
+        table_alias + alias_node.alias: getattr(alias_node.args["alias"], "_type", None)
+        for alias_node in bfs_limited(table_node.args["this"], 1, (exp.Alias))
+    }
+    return dict(columns, **aliases)
+
+
+def _get_columns_from_subquery(
+    subquery_node: exp.Subquery, table_alias: str
+) -> dict[str, str | None]:
     next_select_node = subquery_node.find(exp.Select)
-    column_names = [
-        column_node.this.this
+    columns = {
+        table_alias
+        + column_node.this.this: getattr(
+            getattr(column_node, "_type", None), "this", None
+        )
         for column_node in bfs_limited(next_select_node, 1, (exp.Column))
-    ]
-    alias_names = [
-        alias_node.alias for alias_node in bfs_limited(next_select_node, 1, (exp.Alias))
-    ]
-    return column_names + alias_names
+    }
+    aliases = {
+        table_alias + alias_node.alias: getattr(alias_node.args["alias"], "_type", None)
+        for alias_node in bfs_limited(next_select_node, 1, (exp.Alias))
+    }
+    return dict(columns, **aliases)
 
 
-# TODO should retun a column object then there can be a simpe function to get
-# the column names
-def get_candidate_column_names(column_node, select):
-    parent_select_node = column_node.parent_select
-    table_nodes = get_table_nodes_from_select(parent_select_node)
-    # TODO: There are situations where we can't parse a from. In these cases,
-    # we can return all columnd available.
-    ctes = get_ctes(select)
+def get_columns_from_table_node(
+    table_node: exp.Table, tree: exp.Select
+) -> dict[str, str | None]:
+    ctes = get_ctes(tree)
 
-    # TODO: also need aliases from the tables! only alias if table.
-    column_names = []
-    for table_node in table_nodes:
-        column_names += get_columns_from_table_node(table_node, ctes)
-    return list(set(column_names))
-
-
-# TODO make columns not just name
-# TODO type table node for cte as well
-# TODO types
-def get_columns_from_table_node(table_node, ctes):
     table_alias = ""
-    # Note: both CTE, Subquery and Table have an alias when available
-    column_names = []
+    # Note: CTE, Subquery and Table have an alias when available
     if table_node.alias:
         table_alias += table_node.alias + "."
+    columns: dict[str, str | None] = {}
     if isinstance(table_node, exp.Table):
         full_table_name = get_full_table_name(table_node)
         # Note: if there is a cte with the same name, that is what we are
-        # referring to.
-        table_node = ctes.get(full_table_name, table_node)
-        if isinstance(table_node, exp.CTE):
-            columns = _get_column_names_from_cte(table_node)
-            column_names += [table_alias + col for col in columns]
+        # referring to. In that case I'll handle the CTE node.
+        node = ctes.get(full_table_name, table_node)
+        if isinstance(node, exp.CTE):
+            columns.update(_get_columns_from_cte(node, table_alias))
         else:
-            columns = get_columns_from_database_table(full_table_name).keys()
-            column_names += [table_alias + col for col in columns]
+            columns.update(
+                get_columns_from_database_table(full_table_name, table_alias)
+            )
 
     elif isinstance(table_node, exp.Subquery):
-        columns = _get_column_names_from_subquery(table_node)
-        column_names += [table_alias + col for col in columns]
+        columns.update(_get_columns_from_subquery(table_node, table_alias))
 
-    return column_names
-
-
-# Note look up columns by table name. look up ctes by table name. not sure if i
-# need to look up column by col name.
-# TODO check if qualifymakes this any easier
+    return columns
 
 
-# TODO could just check if the cte in by traversing the tree
-def get_ctes(select_node):
-    ctes = {}
-    # Full name of a cte is always == alias.
-    if "with" in select_node.args.keys():
-        for cte in select_node.args["with"].args["expressions"]:
-            ctes[cte.alias] = cte
-    return ctes
+def get_candidate_column_names(column_node: exp.Column, tree: exp.Select):
+    """tree is the top level node"""
+    parent_select_node = column_node.parent_select
+    table_nodes = get_table_nodes_from_select(parent_select_node)
+    # TODO: There are situations where we can't parse a from. In these cases,
+    # we can return all columns available.
+    column_names = []
+    for table_node in table_nodes:
+        column_names += list(get_columns_from_table_node(table_node, tree).keys())
+
+    return list(set(column_names))
 
 
 def get_full_table_name(table_node: exp.Table) -> str:
@@ -305,43 +315,6 @@ def get_full_table_name(table_node: exp.Table) -> str:
         full_table_name += table_node.db + "."
     full_table_name += table_node.this.name
     return full_table_name
-
-
-def get_table_nodes_from_select(select_node) -> list[exp.Table | exp.Subquery]:
-    """
-    Get all table definitions (FROM, JOIN, CTEs) from a Select node.
-    Returns a dictionary mapping table aliases (or names) to their definitions (Select or Table nodes).
-    """
-    table_nodes = []
-
-    # FROM clause
-
-    from_clause = select_node.args.get("from")
-    if from_clause:
-        # Note: Could also be a Subquery/CTE, but CTEs are alsp exp.Table
-        table_node = from_clause.this
-        table_nodes.append(table_node)
-
-    # JOIN clauses
-    for join in select_node.args.get("joins", []):
-        # Note: Could also be a Subquery/CTE, but CTEs are alsp exp.Table
-        table_node = join.this
-        table_nodes.append(table_node)
-
-    return table_nodes
-
-
-# TODO make this column nodes
-def get_columns_from_select(select_node):
-    """
-    Get columns directly selected in a select node.
-    Returns a list of column names.
-    """
-    columns = []
-    for exp_node in select_node.expressions:
-        if isinstance(exp_node, exp.Column):
-            columns.append(exp_node.name)
-    return columns
 
 
 def get_database_table_names(schema=SCHEMA) -> list[str]:
@@ -355,62 +328,81 @@ def get_database_table_names(schema=SCHEMA) -> list[str]:
     return tables
 
 
-def get_columns_from_database_table(full_table_name: str, schema=SCHEMA):
-    # TODO: consider allowing for non full tables or assert the
-    # schema structure
-    catalog, db, table = full_table_name.split(".")
-    return schema[catalog][db][table]
+def get_candidate_cte_names(tree) -> list[str]:
+    candidate_cte_names = [node.alias for node in tree.find_all(exp.CTE)]
+    return candidate_cte_names
 
 
-# TODO change candidae table names
-def generate_diagnostics(tree, lines):
-    diagnostics = []
-    all_tables = set(get_database_table_names())
-    cte_names = set(get_candidate_cte_names(tree))
+def get_candidate_table_names(prefix: str, tree: exp.Select) -> list[str]:
+    database_table_names: list[str] = get_database_table_names()
+    cte_table_names: list[str] = get_candidate_cte_names(tree)
+    all_table_names: list[str] = database_table_names + cte_table_names
+    # Note: prefix will never contain a dot at the end. TODO test this, nvim
+    # not letting me.
+    candidate_table_names = [
+        table_name
+        for table_name in all_table_names
+        if table_name.startswith(prefix) or table_name.startswith(prefix + ".")
+    ]
+    return candidate_table_names
 
+
+def generate_diagnostics(tree: exp.Select, lines: list[str]):
+    # TODO type
+    diagnostics: list[Diagnostic] = []
+    all_tables: set[str] = set(get_database_table_names()).union(
+        set(get_candidate_cte_names(tree))
+    )
     for node in tree.find_all(exp.Table):
-        table_name = get_full_table_name(node)
-        if table_name not in all_tables and node.this.name not in cte_names:
-            start_offset = node.meta.get("start")
-            end_offset = node.meta.get("end") + 1
-            diagnostics.append(
-                Diagnostic(
-                    range=Range(
-                        start=offset_to_lsp_position(lines, start_offset),
-                        end=offset_to_lsp_position(lines, end_offset),
-                    ),
-                    message=f"Unknown table: '{table_name}'",
-                    severity=DiagnosticSeverity.Error,
-                    source="sql_lsp",
+        table_name: str = get_full_table_name(node)
+        # TODO
+        if table_name not in all_tables:
+            if node.meta.get("start") or node.meta.get("end"):
+                # TODO start and end update if pos
+                start_offset: int = node.meta.get("start")
+                end_offset: int = node.meta.get("end") + 1
+                diagnostics.append(
+                    Diagnostic(
+                        range=Range(
+                            start=offset_to_lsp_position(lines, start_offset),
+                            end=offset_to_lsp_position(lines, end_offset),
+                        ),
+                        message=f"Unknown table: '{table_name}'",
+                        severity=DiagnosticSeverity.Error,
+                        source="sql_lsp",
+                    )
                 )
-            )
-
-    for node in tree.find_all(exp.Column):
-        if node._type.this == exp.DataType.Type.UNKNOWN:
-            start_offset = node.meta.get("start")
-            end_offset = node.meta.get("end") + 1
-            diagnostics.append(
-                Diagnostic(
-                    range=Range(
-                        start=offset_to_lsp_position(lines, start_offset),
-                        end=offset_to_lsp_position(lines, end_offset),
-                    ),
-                    message=f"Unknown column type for '{node.this.this}'",
-                    severity=DiagnosticSeverity.Warning,
-                    source="sql_lsp",
-                )
-            )
 
     for node in tree.find_all(exp.Column):
         parent_select = node.parent_select
         if parent_select:
-            available_columns = set(get_candidate_column_names(node, parent_select))
+            available_column_names = set(get_candidate_column_names(node, tree))
             # Get column name helper
             column_name = ""
             if node.table:
                 column_name += node.table + "."
             column_name += node.this.this
-            if column_name not in available_columns:
+            if column_name not in available_column_names:
+                # TODO
+                if node.meta.get("start") or node.meta.get("end"):
+                    start_offset = node.meta.get("start")
+                    end_offset = node.meta.get("end") + 1
+                    diagnostics.append(
+                        Diagnostic(
+                            range=Range(
+                                start=offset_to_lsp_position(lines, start_offset),
+                                end=offset_to_lsp_position(lines, end_offset),
+                            ),
+                            message=f"Unknown column: '{column_name}'",
+                            severity=DiagnosticSeverity.Error,
+                            source="sql_lsp",
+                        )
+                    )
+
+    for node in tree.find_all(exp.Column):
+        if node._type.this == exp.DataType.Type.UNKNOWN:
+            # TODO
+            if node.meta.get("start") or node.meta.get("end"):
                 start_offset = node.meta.get("start")
                 end_offset = node.meta.get("end") + 1
                 diagnostics.append(
@@ -419,9 +411,8 @@ def generate_diagnostics(tree, lines):
                             start=offset_to_lsp_position(lines, start_offset),
                             end=offset_to_lsp_position(lines, end_offset),
                         ),
-                        message=f"Unknown column: '{column_name}'",
-                        severity=DiagnosticSeverity.Error,
-                        # TODO change source
+                        message=f"Unknown column type for '{node.this.this}'",
+                        severity=DiagnosticSeverity.Warning,
                         source="sql_lsp",
                     )
                 )
@@ -433,12 +424,25 @@ def generate_diagnostics(tree, lines):
 def did_change(params: DidChangeTextDocumentParams):
     doc = server.workspace.get_text_document(params.text_document.uri)
     lines = doc.source.splitlines()
-
+    """
+    tree = parse_one(doc.source, dialect=DIALECT, error_level=ErrorLevel.IGNORE)
+    tree_has_types = False
+    try:
+        # Note: qual can only be used when all the columns are known
+        qual = qualify(tree, dialect=DIALECT, schema=SCHEMA)
+        tree = annotate_types(qual, dialect=DIALECT, schema=SCHEMA)
+        tree_has_types = True
+    except OptimizeError:
+        pass
+    diagnostics = generate_diagnostics(tree, lines, tree_has_types)
+    server.publish_diagnostics(doc.uri, diagnostics)
+    """
     tree_0 = parse_one(doc.source, dialect=DIALECT, error_level=ErrorLevel.IGNORE)
-    # TODO see if qualify should be used always
-    qual = qualify(tree_0, dialect="spark", schema=SCHEMA)
-    tree = annotate_types(qual, dialect="spark", schema=SCHEMA)
-
+    # Note: qual can only be used when all the columns are known
+    qual = qualify(
+        tree_0, dialect=DIALECT, schema=SCHEMA, validate_qualify_columns=False
+    )
+    tree = annotate_types(qual, dialect=DIALECT, schema=SCHEMA)
     diagnostics = generate_diagnostics(tree, lines)
     server.publish_diagnostics(doc.uri, diagnostics)
 
@@ -460,10 +464,7 @@ def completions(params: CompletionParams):
         if node.db:
             prefix += node.db + "."
         prefix += node.this.name
-        # TODO pass node?
         candidate_table_names = get_candidate_table_names(prefix, tree)
-        # TODO candidate table names is like helper for getting the names form
-        # a list of table nodes? candidate has to do with autocomplete I think?
         items = [
             CompletionItem(label=t, kind=CompletionItemKind.Class)
             for t in candidate_table_names
@@ -471,7 +472,6 @@ def completions(params: CompletionParams):
         return CompletionList(is_incomplete=False, items=items)
 
     if node and isinstance(node, exp.Column):
-        # Again helper over types?
         candidate_column_names = get_candidate_column_names(node, tree)
         items = [
             CompletionItem(label=t, kind=CompletionItemKind.Class)
@@ -491,8 +491,8 @@ def hover(params: HoverParams):
     line_position = params.position.line
     line = doc.source.splitlines()[line_position]
 
-    tree_0 = parse_one(doc.source, dialect=DIALECT, error_level=ErrorLevel.IGNORE)
-    qual = qualify(tree_0, dialect="spark", schema=SCHEMA)
+    tree = parse_one(doc.source, dialect=DIALECT, error_level=ErrorLevel.IGNORE)
+    qual = qualify(tree, dialect="spark", schema=SCHEMA, validate_qualify_columns=False)
     tree = annotate_types(qual, dialect="spark", schema=SCHEMA)
     cursor_offset = lsp_position_to_cursor_offset(lines, line_position, cursor_position)
     node = find_node_before_cursor(tree, cursor_offset)
@@ -503,11 +503,9 @@ def hover(params: HoverParams):
         )
         return Hover(contents=content)
 
-    # TODO: add types.
     if node and isinstance(node.parent, exp.Table):
-        ctes = get_ctes(tree)
-        columns = get_columns_from_table_node(node.parent, ctes)
-        column_list = "\n".join([f"- {col}" for col in columns])
+        columns = get_columns_from_table_node(node.parent, tree)
+        column_list = "\n".join([f"- {col}: {_type}" for col, _type in columns.items()])
         content = MarkupContent(
             kind=MarkupKind.Markdown,
             value=f"**Columns:**\n{column_list}",

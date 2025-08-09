@@ -14,7 +14,7 @@ def sql2():
 
 
 def test_get_candidate_ctes(sql):
-    from databricks_sql_lsp import get_candidate_cte_names
+    from sql_lsp import get_candidate_cte_names
 
     tree = parse_one(sql, dialect="spark", error_level=ErrorLevel.IGNORE)
     candidate_ctes = get_candidate_cte_names(tree)
@@ -22,7 +22,7 @@ def test_get_candidate_ctes(sql):
 
 
 def test_get_table_nodes_from_select(sql2):
-    from databricks_sql_lsp import get_table_nodes_from_select
+    from sql_lsp import get_table_nodes_from_select
 
     select_node = parse_one(sql2, dialect="spark", error_level=ErrorLevel.IGNORE)
     table_nodes = get_table_nodes_from_select(select_node)
@@ -33,7 +33,7 @@ def test_get_table_nodes_from_select(sql2):
 
 
 def test_get_table_nodes_from_select_2(sql2):
-    from databricks_sql_lsp import get_table_nodes_from_select
+    from sql_lsp import get_table_nodes_from_select
 
     tree = parse_one(sql2, dialect="spark", error_level=ErrorLevel.IGNORE)
     column_node = [
@@ -50,7 +50,7 @@ def test_get_table_nodes_from_select_2(sql2):
 
 
 def test_get_candidate_column_names(sql2):
-    from databricks_sql_lsp import get_candidate_column_names
+    from sql_lsp import get_candidate_column_names
 
     tree = parse_one(sql2, dialect="spark", error_level=ErrorLevel.IGNORE)
     column_node = [
@@ -92,7 +92,7 @@ def test_get_candidate_column_names(sql2):
 
 
 def test_get_candidate_column_names_2(sql2):
-    from databricks_sql_lsp import get_candidate_column_names
+    from sql_lsp import get_candidate_column_names
 
     tree = parse_one(sql2, dialect="spark", error_level=ErrorLevel.IGNORE)
     column_node = [
@@ -106,7 +106,7 @@ def test_get_candidate_column_names_2(sql2):
 
 
 def test_annotate_types(sql2):
-    from databricks_sql_lsp import get_all_table_names, get_columns_for_table
+    from sql_lsp import get_all_table_names, get_columns_for_table
 
     from sqlglot.optimizer.annotate_types import annotate_types
     from sqlglot.expressions import DataType
