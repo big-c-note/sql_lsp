@@ -192,7 +192,10 @@ def get_columns_from_database_table(
 ) -> dict[str, str | None]:
     # TODO: consider allowing for non full tables or assert the
     # schema structure
-    catalog, db, table = full_table_name.split(".")
+    try:
+        catalog, db, table = full_table_name.split(".")
+    except ValueError:
+        return {}
     # TODO: do i need ti hamdle keys here?
     columns: dict[str, str | None] = schema[catalog][db][table]
     columns_with_alias: dict[str, str | None] = {
