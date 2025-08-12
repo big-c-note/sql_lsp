@@ -1,6 +1,7 @@
 from collections import defaultdict, deque
 import json
 import logging
+from os import wait
 from pathlib import Path
 import typing as t
 
@@ -188,12 +189,13 @@ def find_node_before_cursor(tree: exp.Select, cursor_offset: int):
 
 def get_columns_from_database_table(
     full_table_name: str, table_alias: str = "", schema=SCHEMA
-) -> dict[str, str]:
+) -> dict[str, str | None]:
     # TODO: consider allowing for non full tables or assert the
     # schema structure
     catalog, db, table = full_table_name.split(".")
-    columns: dict[str, str] = schema[catalog][db][table]
-    columns_with_alias: dict[str, str] = {
+    # TODO: do i need ti hamdle keys here?
+    columns: dict[str, str | None] = schema[catalog][db][table]
+    columns_with_alias: dict[str, str | None] = {
         table_alias + col: _type for col, _type in columns.items()
     }
     return columns_with_alias
@@ -242,7 +244,7 @@ def _get_columns_from_cte(
         for column_node in bfs_limited(table_node.args["this"], 1, (exp.Column))
     }
     aliases = {
-        table_alias + alias_node.alias: getattr(alias_node.args["alias"], "_type", None)
+        table_alias + alias_node.alias: getattr(alias_node, "_type", None)
         for alias_node in bfs_limited(table_node.args["this"], 1, (exp.Alias))
     }
     return dict(columns, **aliases)
@@ -260,7 +262,7 @@ def _get_columns_from_subquery(
         for column_node in bfs_limited(next_select_node, 1, (exp.Column))
     }
     aliases = {
-        table_alias + alias_node.alias: getattr(alias_node.args["alias"], "_type", None)
+        table_alias + alias_node.alias: getattr(alias_node, "_type", None)
         for alias_node in bfs_limited(next_select_node, 1, (exp.Alias))
     }
     return dict(columns, **aliases)
@@ -275,21 +277,20 @@ def get_columns_from_table_node(
     # Note: CTE, Subquery and Table have an alias when available
     if table_node.alias:
         table_alias += table_node.alias + "."
-    columns: dict[str, str | None] = {}
     if isinstance(table_node, exp.Table):
         full_table_name = get_full_table_name(table_node)
         # Note: if there is a cte with the same name, that is what we are
         # referring to. In that case I'll handle the CTE node.
         node = ctes.get(full_table_name, table_node)
         if isinstance(node, exp.CTE):
-            columns.update(_get_columns_from_cte(node, table_alias))
+            columns: dict[str, str | None] = _get_columns_from_cte(node, table_alias)
         else:
-            columns.update(
-                get_columns_from_database_table(full_table_name, table_alias)
-            )
+            columns = get_columns_from_database_table(full_table_name, table_alias)
 
     elif isinstance(table_node, exp.Subquery):
-        columns.update(_get_columns_from_subquery(table_node, table_alias))
+        columns = _get_columns_from_subquery(table_node, table_alias)
+    else:
+        columns = {}
 
     return columns
 
